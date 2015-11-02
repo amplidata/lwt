@@ -23,20 +23,9 @@
 
 open Lwt
 
-type t = { mutable locked : bool; mutable waiters : unit Lwt.u Lwt_sequence.t  }
+type t = { mutable locked : bool; mutable waiters : (unit Lwt.u * bool ref) Lwt_sequence.t  }
 
 let create () = { locked = false; waiters = Lwt_sequence.create () }
-
-let rec lock m =
-  if m.locked then begin
-    let (res, w) = Lwt.task () in
-    let node = Lwt_sequence.add_r w m.waiters in
-    Lwt.on_cancel res (fun _ -> Lwt_sequence.remove node);
-    res
-  end else begin
-    m.locked <- true;
-    Lwt.return ()
-  end
 
 let unlock m =
   if m.locked then begin
@@ -45,7 +34,27 @@ let unlock m =
     else
       (* We do not use [Lwt.wakeup] here to avoid a stack overflow
          when unlocking a lot of threads. *)
-      Lwt.wakeup_later (Lwt_sequence.take_l m.waiters) ()
+      let (w, is_locked) = Lwt_sequence.take_l m.waiters in
+      is_locked := true;
+      Lwt.wakeup_later w ()
+  end
+
+let rec lock m =
+  if m.locked then begin
+    let (res, w) = Lwt.task () in
+    let is_locked = ref false in
+    let node = Lwt_sequence.add_r (w,is_locked) m.waiters in
+    Lwt.on_cancel res (fun _ -> Lwt_sequence.remove node);
+    try_lwt
+      res
+    with | e -> begin
+      if !is_locked then
+        unlock m;
+        Lwt.fail e
+      end
+  end else begin
+    m.locked <- true;
+    Lwt.return ()
   end
 
 let with_lock m f =
